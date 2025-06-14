@@ -5,7 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\ParentalControlSettings;
 use Illuminate\Http\Request;
 
-class ParentalControlSettingsController extends Controller
+class WindowsParentalControlController extends Controller
 {
     private $appDomains = [
         'YouTube' => [
@@ -34,9 +34,16 @@ class ParentalControlSettingsController extends Controller
         ],
     ];
 
+    private $hostsFilePath;
+    private $proxyConfigPath;
+
     public function __construct()
     {
-        // Load custom apps from the database on controller initialization
+        // Windows paths
+        $this->hostsFilePath = 'C:\Windows\System32\drivers\etc\hosts';
+        $this->proxyConfigPath = storage_path('app/proxy_config.json');
+        
+        // Load custom apps from the database
         $settings = ParentalControlSettings::first();
         if ($settings && $settings->custom_apps) {
             $customApps = json_decode($settings->custom_apps, true) ?? [];
@@ -49,7 +56,7 @@ class ParentalControlSettingsController extends Controller
         $request->validate([
             'app_restrictions' => 'nullable|json',
             'internet_restricted' => 'nullable|boolean',
-            'custom_apps' => 'nullable|json', // Add custom_apps to store new apps/sites
+            'custom_apps' => 'nullable|json',
         ]);
 
         $settings = ParentalControlSettings::updateOrCreate([], $request->all());
@@ -63,7 +70,7 @@ class ParentalControlSettingsController extends Controller
             'app_restrictions' => json_decode($settings->app_restrictions, true) ?? [],
             'internet_restricted' => $settings->internet_restricted ?? false,
             'custom_apps' => json_decode($settings->custom_apps, true) ?? [],
-            'available_apps' => array_keys($this->appDomains), // Return all available apps
+            'available_apps' => array_keys($this->appDomains),
         ]);
     }
 
@@ -72,16 +79,14 @@ class ParentalControlSettingsController extends Controller
         $request->validate([
             'name' => 'required|string',
             'domains' => 'required|array',
-            'domains.*' => 'required|string', // Ensure each domain is a string
+            'domains.*' => 'required|string',
         ]);
 
         $name = $request->input('name');
         $domains = $request->input('domains');
-
-        // Normalize the name (e.g., "WhatsApp" to "WhatsApp")
         $name = ucfirst(strtolower($name));
 
-        // Validate domains (basic check for valid domain format)
+        // Validate domains
         foreach ($domains as $domain) {
             if (!preg_match('/^[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/', $domain)) {
                 return response()->json(['error' => "Invalid domain: $domain"], 400);
@@ -90,15 +95,11 @@ class ParentalControlSettingsController extends Controller
 
         $settings = ParentalControlSettings::firstOrCreate([]);
         $customApps = json_decode($settings->custom_apps, true) ?? [];
-
-        // Add the new app/site to custom_apps
         $customApps[$name] = $domains;
         $settings->custom_apps = json_encode($customApps);
         $settings->save();
 
-        // Update the in-memory appDomains
         $this->appDomains[$name] = $domains;
-
         \Log::info("Added new app/site to restrict: $name", ['domains' => $domains]);
 
         return response()->json(['success' => true, 'message' => "Added $name to restricted apps/sites"]);
@@ -113,6 +114,7 @@ class ParentalControlSettingsController extends Controller
 
         $settings = ParentalControlSettings::firstOrCreate([]);
         $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
+        
         if (!in_array($app, $appRestrictions)) {
             $appRestrictions[] = $app;
             $settings->app_restrictions = json_encode($appRestrictions);
@@ -120,8 +122,8 @@ class ParentalControlSettingsController extends Controller
             \Log::info("Restricted app: $app");
         }
 
-        // Update the Squid blocklist
-        $this->updateSquidBlocklist();
+        // Update Windows blocking mechanism
+        $this->updateWindowsBlocking();
 
         return response()->json(['success' => true]);
     }
@@ -135,6 +137,7 @@ class ParentalControlSettingsController extends Controller
 
         $settings = ParentalControlSettings::firstOrCreate([]);
         $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
+        
         if (in_array($app, $appRestrictions)) {
             $appRestrictions = array_diff($appRestrictions, [$app]);
             $settings->app_restrictions = json_encode($appRestrictions);
@@ -142,9 +145,7 @@ class ParentalControlSettingsController extends Controller
             \Log::info("Allowed app: $app");
         }
 
-        // Update the Squid blocklist
-        $this->updateSquidBlocklist();
-
+        $this->updateWindowsBlocking();
         return response()->json(['success' => true]);
     }
 
@@ -154,10 +155,9 @@ class ParentalControlSettingsController extends Controller
         $settings->internet_restricted = true;
         $settings->save();
 
-        // Update the Squid configuration to block all traffic
-        $this->updateSquidConfig(true);
-
-        \Log::info("Internet access restricted via Squid proxy");
+        // Disable network adapter or set restrictive firewall rules
+        $this->blockAllInternet();
+        \Log::info("Internet access restricted");
 
         return response()->json(['success' => true]);
     }
@@ -168,10 +168,8 @@ class ParentalControlSettingsController extends Controller
         $settings->internet_restricted = false;
         $settings->save();
 
-        // Update the Squid configuration to allow traffic
-        $this->updateSquidConfig(false);
-
-        \Log::info("Internet access allowed via Squid proxy");
+        $this->unblockAllInternet();
+        \Log::info("Internet access allowed");
 
         return response()->json(['success' => true]);
     }
@@ -187,100 +185,192 @@ class ParentalControlSettingsController extends Controller
         ]);
     }
 
-    private function updateSquidBlocklist()
+    /**
+     * Method 1: Use Windows hosts file to block domains
+     */
+    private function updateHostsFile()
     {
-        $settings = ParentalControlSettings::firstOrCreate([]);
-        $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
+        try {
+            $settings = ParentalControlSettings::firstOrCreate([]);
+            $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
 
-        // Build the list of domains to block as regex patterns
+            // Read current hosts file
+            $hostsContent = file_get_contents($this->hostsFilePath);
+            
+            // Remove existing parental control entries
+            $hostsLines = explode("\n", $hostsContent);
+            $cleanedLines = array_filter($hostsLines, function($line) {
+                return strpos($line, '# ParentalControl') === false;
+            });
+
+            // Add blocked domains
+            $blockedDomains = [];
+            foreach ($appRestrictions as $app) {
+                if (isset($this->appDomains[$app])) {
+                    foreach ($this->appDomains[$app] as $domain) {
+                        $blockedDomains[] = "127.0.0.1 $domain # ParentalControl";
+                        $blockedDomains[] = "127.0.0.1 www.$domain # ParentalControl";
+                    }
+                }
+            }
+
+            // Combine content
+            $newHostsContent = implode("\n", $cleanedLines);
+            if (!empty($blockedDomains)) {
+                $newHostsContent .= "\n\n# Parental Control Blocked Domains\n";
+                $newHostsContent .= implode("\n", $blockedDomains);
+            }
+
+            // Write to temporary file first
+            $tempFile = sys_get_temp_dir() . '/hosts_temp';
+            file_put_contents($tempFile, $newHostsContent);
+
+            // Copy to hosts file (requires admin privileges)
+            $result = shell_exec("copy \"$tempFile\" \"$this->hostsFilePath\" 2>&1");
+            
+            // Flush DNS cache
+            shell_exec("ipconfig /flushdns 2>&1");
+
+            \Log::info("Updated Windows hosts file for domain blocking");
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to update hosts file: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Method 2: Use Windows Firewall to block domains/IPs
+     */
+    private function updateWindowsFirewall()
+    {
+        try {
+            $settings = ParentalControlSettings::firstOrCreate([]);
+            $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
+
+            // Remove existing parental control firewall rules
+            shell_exec('netsh advfirewall firewall delete rule name="ParentalControl_Block" 2>&1');
+
+            // Add new blocking rules for each restricted app
+            foreach ($appRestrictions as $app) {
+                if (isset($this->appDomains[$app])) {
+                    foreach ($this->appDomains[$app] as $domain) {
+                        // Block outbound connections to domain
+                        $cmd = "netsh advfirewall firewall add rule name=\"ParentalControl_Block_$domain\" " .
+                               "dir=out action=block remoteip=any " .
+                               "description=\"Block access to $domain\" 2>&1";
+                        shell_exec($cmd);
+                    }
+                }
+            }
+
+            \Log::info("Updated Windows Firewall rules for domain blocking");
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to update firewall rules: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Method 3: Use PowerShell to set proxy settings
+     */
+    private function updateProxySettings()
+    {
+        try {
+            $settings = ParentalControlSettings::firstOrCreate([]);
+            $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
+
+            if (!empty($appRestrictions)) {
+                // Create a PAC file for proxy auto-config
+                $pacContent = $this->generatePacFile($appRestrictions);
+                $pacFile = storage_path('app/proxy.pac');
+                file_put_contents($pacFile, $pacContent);
+
+                // Set proxy settings via PowerShell
+                $powershellCmd = 'powershell -Command "' .
+                    'Set-ItemProperty -Path \"HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\" -Name ProxyEnable -Value 1; ' .
+                    'Set-ItemProperty -Path \"HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\" -Name AutoConfigURL -Value \"file:///' . str_replace('\\', '/', $pacFile) . '\"' .
+                    '"';
+                
+                shell_exec($powershellCmd);
+            } else {
+                // Disable proxy
+                $powershellCmd = 'powershell -Command "' .
+                    'Set-ItemProperty -Path \"HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\" -Name ProxyEnable -Value 0' .
+                    '"';
+                shell_exec($powershellCmd);
+            }
+
+            \Log::info("Updated proxy settings for domain blocking");
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to update proxy settings: " . $e->getMessage());
+        }
+    }
+
+    private function generatePacFile($appRestrictions)
+    {
         $blockedDomains = [];
         foreach ($appRestrictions as $app) {
             if (isset($this->appDomains[$app])) {
                 foreach ($this->appDomains[$app] as $domain) {
-                    // Escape dots and match domain and subdomains
-                    $escapedDomain = str_replace('.', '\.', $domain);
-                    $blockedDomains[] = $escapedDomain;
-                    \Log::debug("Adding domain to blocklist: $escapedDomain");
+                    $blockedDomains[] = $domain;
                 }
             }
         }
 
-        // Write the blocklist to /etc/squid/blocked_domains.acl
-        $blocklistContent = implode("\n", array_unique($blockedDomains));
-        file_put_contents('/tmp/blocked_domains.acl', $blocklistContent);
-        $result = shell_exec("sudo mv /tmp/blocked_domains.acl /etc/squid/blocked_domains.acl 2>&1");
-        if (strpos($result, 'error') !== false) {
-            \Log::error("Failed to update Squid blocklist: $result");
-        } else {
-            \Log::info("Updated Squid blocklist: " . $blocklistContent);
+        $domainsJs = json_encode($blockedDomains);
+        
+        return "
+function FindProxyForURL(url, host) {
+    var blockedDomains = $domainsJs;
+    
+    for (var i = 0; i < blockedDomains.length; i++) {
+        if (shExpMatch(host, '*' + blockedDomains[i] + '*')) {
+            return 'PROXY 127.0.0.1:9999'; // Block by routing to non-existent proxy
         }
+    }
+    
+    return 'DIRECT';
+}";
+    }
 
-        // Reload Squid to apply the changes
-        $reloadResult = shell_exec("sudo systemctl reload squid 2>&1");
-        if (strpos($reloadResult, 'error') !== false) {
-            \Log::error("Failed to reload Squid: $reloadResult");
-        } else {
-            \Log::info("Squid reloaded successfully");
+    private function updateWindowsBlocking()
+    {
+        // Use multiple methods for better coverage
+        $this->updateHostsFile();
+        $this->updateWindowsFirewall();
+        $this->updateProxySettings();
+    }
+
+    private function blockAllInternet()
+    {
+        try {
+            // Method 1: Disable network adapters
+            shell_exec('powershell -Command "Get-NetAdapter | Where-Object {$_.Status -eq \"Up\"} | Disable-NetAdapter -Confirm:$false" 2>&1');
+            
+            // Method 2: Block all outbound traffic via firewall
+            shell_exec('netsh advfirewall firewall add rule name="ParentalControl_BlockAll" dir=out action=block remoteip=any 2>&1');
+            
+            \Log::info("Blocked all internet access");
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to block internet: " . $e->getMessage());
         }
     }
 
-    private function updateSquidConfig($blockAll = false)
+    private function unblockAllInternet()
     {
-        $settings = ParentalControlSettings::firstOrCreate([]);
-        $appRestrictions = json_decode($settings->app_restrictions, true) ?? [];
-
-        // Base Squid configuration
-        $config = [
-            "# Squid configuration file",
-            "http_port 3128 transparent",
-            "",
-            "# Define the blocklist using url_regex",
-            'acl blocked_domains url_regex -i "/etc/squid/blocked_domains.acl"',
-            "",
-        ];
-
-        // Add block all rule if internet is restricted
-        if ($blockAll) {
-            $config[] = "# Block all traffic";
-            $config[] = "acl block_all dstdomain .";
-            $config[] = "http_access deny block_all";
-            $config[] = "";
-        } else {
-            // If internet is not restricted, still block specific apps
-            if (!empty($appRestrictions)) {
-                $config[] = "# Deny access to blocked domains";
-                $config[] = "http_access deny blocked_domains";
-                $config[] = "";
-            }
-        }
-
-        // Allow all other traffic
-        $config[] = "# Allow all other traffic";
-        $config[] = "http_access allow all";
-        $config[] = "";
-        $config[] = "# Define localnet (your local machine)";
-        $config[] = "acl localnet src 127.0.0.1";
-        $config[] = "acl localnet src ::1";
-        $config[] = "";
-        $config[] = "# Logging";
-        $config[] = "access_log /var/log/squid/access.log squid issah:squid 640";
-
-        // Write the new configuration to /etc/squid/squid.conf
-        $configContent = implode("\n", $config);
-        file_put_contents('/tmp/squid.conf', $configContent);
-        $result = shell_exec("sudo mv /tmp/squid.conf /etc/squid/squid.conf 2>&1");
-        if (strpos($result, 'error') !== false) {
-            \Log::error("Failed to update Squid config: $result");
-        } else {
-            \Log::info("Updated Squid config: " . $configContent);
-        }
-
-        // Reload Squid to apply the changes
-        $reloadResult = shell_exec("sudo systemctl reload squid 2>&1");
-        if (strpos($reloadResult, 'error') !== false) {
-            \Log::error("Failed to reload Squid: $reloadResult");
-        } else {
-            \Log::info("Squid reloaded successfully");
+        try {
+            // Method 1: Enable network adapters
+            shell_exec('powershell -Command "Get-NetAdapter | Where-Object {$_.Status -eq \"Disabled\"} | Enable-NetAdapter -Confirm:$false" 2>&1');
+            
+            // Method 2: Remove blocking firewall rule
+            shell_exec('netsh advfirewall firewall delete rule name="ParentalControl_BlockAll" 2>&1');
+            
+            \Log::info("Unblocked all internet access");
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to unblock internet: " . $e->getMessage());
         }
     }
 }
